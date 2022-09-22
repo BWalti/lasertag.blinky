@@ -20,16 +20,26 @@ namespace Blinky
         private const byte CommandBytesPerBit = 4;
 
         private static readonly ArrayList CommandBytesLookup;
-        private const ushort HighSignalDuration = 480;
-        private const ushort LowSignalDuration = 240;
-        private const byte ClockDivider = 200;
 
+        private const uint SourceClockHz = 80000000;
+        private const ushort CarrierHz = 40000;
+        private const byte ClockDivider = 200;
+        private const float TickDurationMicroSecond = 1000000 / (SourceClockHz / (float)ClockDivider);
+        
+        private const ushort HighSignalDuration = (ushort)(500 / TickDurationMicroSecond);
+        private const ushort LowSignalDuration = (ushort)(250 / TickDurationMicroSecond);
+        private const ushort PauseSignalDuration = (ushort)(250 / TickDurationMicroSecond);
+
+        private const ushort InitialPulseDuration0 = 200 * 7;
+        private const ushort InitialPulseDuration1 = 200;
+        private const ushort Margin = 30;
+        
         private readonly ReceiverChannel _receiver;
         private readonly TransmitterChannel _sender;
-        private string _data;
         private byte[] _dataBytes;
 
         private byte[] _payload;
+        private byte[] _initialPulseCommandBytes;
 
         static IrExperiment()
         {
@@ -49,47 +59,90 @@ namespace Blinky
 
                 CarrierEnabled = true,
                 CarrierLevel = true,
-                CarrierLowDuration = 5,
-                CarrierHighDuration = 5
+                CarrierLowDuration = (ushort)(SourceClockHz / (2 * CarrierHz)), // 50% of Carrier
+                CarrierHighDuration = (ushort)(SourceClockHz / (2 * CarrierHz)) // 50% of Carrier
             };
 
-            _receiver = new ReceiverChannel(19, 500)
+            _receiver = new ReceiverChannel(23, 30 * BitsPerByte)
             {
-                ClockDivider = ClockDivider,
-                SourceClock = SourceClock.APB
+                SourceClock = SourceClock.APB,
+                ClockDivider = ClockDivider
             };
 
-            _receiver.EnableFilter(true, 210);
-            _receiver.SetIdleThresold(2000);
+            _receiver.EnableFilter(true, 200);
+            _receiver.SetIdleThresold(2000*9);
             _receiver.ReceiveTimeout = TimeSpan.FromMilliseconds(10);
             _receiver.Start(true);
         }
 
         private void SenderThread()
         {
-            _sender.AddCommand(new RmtCommand(200 * 7, true, 200, false));
-            for (var i = 0; i < 16; i++)
-                _sender.AddCommand(new RmtCommand(HighSignalDuration, i % 2 == 0, LowSignalDuration, i % 2 != 0));
-
+            byte i = 0;
             while (true)
             {
+                PrepareData(1,1, i++);
                 _sender.SendData(_payload, true);
-                //_sender.Send(false);
+                Thread.Sleep(1000);
 
-                Thread.Sleep(500);
+                i %= 20;
+            }
+        }
 
+        private void ReceiverThread()
+        {
+            while (true)
+            {
+                Thread.Sleep(300);
+                
                 var result = _receiver.GetAllItems();
+                if (result == null || result.Length < 8) continue;
 
-                if (result == null) continue;
-
-                Debug.WriteLine("====================");
-                Debug.WriteLine("New Set of commands:");
-                for (var i = 0; i < result.Length; i++)
+                var initialPulse = result[0];
+                if (initialPulse.Duration0 < InitialPulseDuration0 - Margin ||
+                    initialPulse.Duration0 > InitialPulseDuration0 + Margin)
+                    continue;
+                
+                var payloadLength = result.Length - 1;
+                var remainder = payloadLength % 8;
+                if (remainder != 0)
                 {
-                    var cmd = result[i];
-                    Debug.WriteLine($"{cmd.Duration0},{cmd.Level0} / {cmd.Duration1},{cmd.Level1}");
+                    continue;
+                }
+
+                var bytes = new byte[payloadLength / 8];
+                if (bytes.Length == 3 && TryParseSignal(result, bytes))
+                {
+                    Debug.WriteLine($"Source: {bytes[0]}, Attack: {bytes[1]}, Counter: {bytes[2]}");
                 }
             }
+        }
+
+        private static bool TryParseSignal(RmtCommand[] result, byte[] bytes)
+        {
+            var payloadLength = result.Length - 1;
+            for (var i = 0; i < payloadLength; i++)
+            {
+                var cmd = result[1 + i];
+                if (cmd.Duration0 > LowSignalDuration - Margin && cmd.Duration0 < LowSignalDuration + Margin)
+                {
+                    // 0 bit:
+                    // do nothing, as per default all bits are zero
+                }
+                else if (cmd.Duration0 > HighSignalDuration - Margin && cmd.Duration0 < HighSignalDuration + Margin)
+                {
+                    // 1 bit:
+                    var bitIndex = i % 8;
+                    var byteIndex = i / 8;
+                    bytes[byteIndex] |= (byte)(1 << (7 - bitIndex));
+                }
+                else
+                {
+                    // cannot parse!
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private static byte[] ConvertToRmtCommandBytes(ushort duration0, bool level0, ushort duration1, bool level1)
@@ -126,8 +179,8 @@ namespace Blinky
         {
             var result = new ArrayList();
 
-            var zeroCommand = ConvertToRmtCommandBytes(LowSignalDuration, true, LowSignalDuration, false);
-            var oneCommand = ConvertToRmtCommandBytes(HighSignalDuration, true, LowSignalDuration, false);
+            var zeroCommand = ConvertToRmtCommandBytes(LowSignalDuration, true, PauseSignalDuration, false);
+            var oneCommand = ConvertToRmtCommandBytes(HighSignalDuration, true, PauseSignalDuration, false);
 
             for (byte b = 0; b < 255; b++)
             {
@@ -170,53 +223,29 @@ namespace Blinky
             return bits;
         }
 
-        public void PrepareData(string data)
+        public void PrepareData(byte source, byte attack, byte shotCounter)
         {
-            _data = data;
-            var dataBytes = Encoding.UTF8.GetBytes(_data);
-            _dataBytes = dataBytes;
-
-            var commandBytes = new byte[8 + _dataBytes.Length * CommandBytesPerByte];
-            commandBytes[0] = 52; // (200 * 7) % 256;
-            commandBytes[1] = 128 + 5; // (200*7 / 256)
-            commandBytes[2] = 200;
-            commandBytes[3] = 0;
+            _dataBytes = new[] { source, attack, shotCounter };
+            
+            var commandBytes = new byte[4 + _dataBytes.Length * CommandBytesPerByte];
+            Array.Copy(_initialPulseCommandBytes, commandBytes, 4);
 
             for (var i = 0; i < _dataBytes.Length; i++)
             {
                 var b = _dataBytes[i];
-                DebugOutputByte(b);
-
                 var command = (byte[])CommandBytesLookup[b];
                 Array.Copy(command, 0, commandBytes, 4 + i * CommandBytesPerByte, CommandBytesPerByte);
             }
 
-            commandBytes[commandBytes.Length - 4] = 200;
-            commandBytes[commandBytes.Length - 3] = 128;
-            commandBytes[commandBytes.Length - 2] = 50;
-            commandBytes[commandBytes.Length - 1] = 0;
-
             _payload = commandBytes;
-        }
-
-        private static void DebugOutputByte(byte b)
-        {
-            var bits = ConvertToBits(b);
-            Debug.Write($"{b}: ");
-            for (var j = 0; j < bits.Length; j++)
-            {
-                Debug.Write($"{bits[j]}");
-            }
-
-            Debug.WriteLine(string.Empty);
         }
 
         public void IrReceiver()
         {
-            PrepareData("Hi");
+            _initialPulseCommandBytes = ConvertToRmtCommandBytes(InitialPulseDuration0, true, InitialPulseDuration1, false);
 
-            //var receiver = new Thread(ReceiverThread);
-            //receiver.Start();
+            var receiver = new Thread(ReceiverThread);
+            receiver.Start();
 
             var sender = new Thread(SenderThread);
             sender.Start();
